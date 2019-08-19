@@ -417,6 +417,7 @@ class VoronoiEnvironment(CustomEnvironment):
         # self.image = self.images[randidx]
         self.image = generate_voronoi_diagram(SHAPE, SHAPE, np.random.randint(5, 12))
         self.image = cv2.cvtColor(self.image, cv2.COLOR_RGB2GRAY)
+        self.image = 255- skimage.segmentation.find_boundaries(self.image).astype(np.uint8)*255
 
         image = self.image.copy()
         image = np.expand_dims(image, 0)
@@ -439,10 +440,11 @@ class VoronoiEnvironment(CustomEnvironment):
         state = np.expand_dims(state, 1) # 1 1 w h 
         self.order = 0
         
-        obs = np.concatenate([image / 255.0, state / 255.0, zeros / 255.0], 1)
+        obs = np.concatenate([image / 255.0, zeros / 255.0, zeros / 255.0], 1)
 
         curr_dist = 1-sklearn.metrics.adjusted_rand_score(self.label.flatten(), self.state.flatten())
         self.prev_dist = curr_dist
+        self.viz = []
         return obs
         
     def _get_n_masks(self, label):
@@ -505,27 +507,29 @@ class VoronoiEnvironment(CustomEnvironment):
 
         # We have estim, now we need to calculate the observation base on the estim
         self.order = self.order+1
-        
-        self.state = self.order*(self.estim>128) + self.state # similar to label
+        self.last_state = self.state.copy()
+        self.state = self.order*(self.estim>128) + self.last_state # similar to label
         state = self.state.copy()
         state = np.expand_dims(state, 0)
         state = np.expand_dims(state, 1) # 1 1 w h 
-        self.order = 0
 
-        self.proba = 255*(self.state > 0)
+
+        # self.proba = 255*(self.state > 0)
+        self.proba = 255- skimage.segmentation.find_boundaries(self.last_state).astype(np.uint8)*255
+        self.proba[self.state==0] = 0
         proba = self.proba.copy()
         proba = np.expand_dims(proba, 0)
         proba = np.expand_dims(proba, 1) # 1 1 w h 
 
-        # print(image.shape, proba.shape)
-        obs = np.concatenate([image / 255.0, state / state.max(),  proba / 255.0], 1)
+        # print(image.shape, estim.shape, proba.shape)
+        obs = np.concatenate([image / 255.0, estim / 255.0,  proba / 255.0], 1)
 
          # Calculate the done
         num_proba_pixels = np.sum(self.proba > 128)
         per_proba_pixels = num_proba_pixels / (SHAPE * SHAPE)
         # print(len(self.coords), per_proba_pixels)
         # done = False if self.coords or per_proba_pixels < 0.95 else True
-        done = True if len(self.coords)==0 or per_proba_pixels > 0.95 else False 
+        done = True if len(self.coords)==0 else False #or per_proba_pixels > 0.95 else False 
 
         #####################################################################
         # # Calculate the reward
@@ -555,13 +559,13 @@ class VoronoiEnvironment(CustomEnvironment):
         # corrects = np.zeros_like(self.label)
         # corrects[self.label==(self.label[y0, x0])] = 255.0
 
-        # def dice_dist(estim, connc):
-        #     # print(estim, connc)
-        #     smooth = .001
-        #     estim = estim.flatten()
-        #     connc = connc.flatten()
-        #     dist = (2*(estim*connc).sum()/(estim.sum()+connc.sum()+smooth))
-        #     return dist
+        def dice_dist(estim, connc):
+            # print(estim, connc)
+            smooth = .001
+            estim = estim.flatten()
+            connc = connc.flatten()
+            dist = (2*(estim*connc).sum()/(estim.sum()+connc.sum()+smooth))
+            return dist
 
         # dice_rwd = 1-dice_dist(estim / 255.0, corrects / 255.0)
 
@@ -574,7 +578,7 @@ class VoronoiEnvironment(CustomEnvironment):
         #     rand_rwd = 0
 
         # rwd = (norm_rwd * dice_rwd + 100*rand_rwd)
-        curr_dist = 1-sklearn.metrics.adjusted_rand_score(self.label.flatten(), self.state.flatten())
+        curr_dist = (1-sklearn.metrics.cluster.fowlkes_mallows_score(self.label.flatten(), self.state.flatten())) * dice_dist(self.estim.flatten() / 255.0, self.proba.flatten() / 255.0) 
         rwd = (self.prev_dist - curr_dist) * norm_rwd
         
 
@@ -591,14 +595,16 @@ class VoronoiEnvironment(CustomEnvironment):
 
         # Log to tensorboard
         # print(self.image.shape, self.label.shape, self.membr.shape, self.field.shape, self.estim.shape, self.state.shape)
-        self.writer.add_image('step', np.concatenate([self.image / 255.0, 
+        self.viz.append(np.concatenate([self.image / 255.0, 
                                                  self.label / (np.max(self.label) + 1e-6), 
                               
                                                  self.image / 255.0 * self.field / 255.0, 
                                                  self.estim / 255.0, 
                                                  self.proba / 255.0,
                                                  self.state / (np.max(self.state) + 1e-6),
-                                                 ], 1), #[0][0], 
+                                                 ], 1)) #[0][0], )
+
+        self.writer.add_image('step', np.concatenate(self.viz, 0),
                                   self.global_step, dataformats='HW')
 
         # Any update on the step
@@ -617,7 +623,7 @@ script_name = os.path.basename(__file__)
 
 writer = SummaryWriter()
 env = VoronoiEnvironment(datadir='data/voronoi', size=100, 
-                         ckpt='pl_voronoi/_ckpt_epoch_100.ckpt', 
+                         ckpt='pl_voronoi/_ckpt_epoch_1000.ckpt', 
                          writer=writer)
 
 
@@ -830,25 +836,43 @@ class Critic(ResNet):
 
 
 ###################################################################################
-class DDPG(object):
+class TD3():
     def __init__(self, writer=None):
+
         # self.actor = Actor(state_dim, action_dim, max_action).to(device)
         # self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
+        # self.critic_1 = Critic(state_dim, action_dim).to(device)
+        # self.critic_1_target = Critic(state_dim, action_dim).to(device)
+        # self.critic_2 = Critic(state_dim, action_dim).to(device)
+        # self.critic_2_target = Critic(state_dim, action_dim).to(device)
+
+        # self.actor_optimizer = optim.Adam(self.actor.parameters())
+        # self.critic_1_optimizer = optim.Adam(self.critic_1.parameters())
+        # self.critic_2_optimizer = optim.Adam(self.critic_2.parameters())
+
         # self.actor_target.load_state_dict(self.actor.state_dict())
+        # self.critic_1_target.load_state_dict(self.critic_1.state_dict())
+        # self.critic_2_target.load_state_dict(self.critic_2.state_dict())
+
         self.actor = Actor(Bottleneck, [3, 4, 6, 3], num_classes=2).to(device)
         self.actor_target = Actor(Bottleneck, [3, 4, 6, 3], num_classes=2).to(device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor_optimizer = optim.Adam(self.actor.parameters(), args.learning_rate)
 
-        # self.critic = Critic(state_dim, action_dim).to(device)
-        # self.critic_target = Critic(state_dim, action_dim).to(device)
-        # self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic = Critic(Bottleneck, [3, 4, 6, 3], num_classes=1).to(device)
-        self.critic_target = Critic(Bottleneck, [3, 4, 6, 3], num_classes=1).to(device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), args.learning_rate)
-        self.replay_buffer = Replay_buffer()
-        self.writer = writer #SummaryWriter()
+        self.critic_1 = Critic(Bottleneck, [3, 4, 6, 3], num_classes=1).to(device)
+        self.critic_1_target = Critic(Bottleneck, [3, 4, 6, 3], num_classes=1).to(device)
+        self.critic_1_target.load_state_dict(self.critic_1.state_dict())
+        self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), args.learning_rate)
+
+        self.critic_2 = Critic(Bottleneck, [3, 4, 6, 3], num_classes=1).to(device)
+        self.critic_2_target = Critic(Bottleneck, [3, 4, 6, 3], num_classes=1).to(device)
+        self.critic_2_target.load_state_dict(self.critic_2.state_dict())
+        self.critic_2_optimizer = optim.Adam(self.critic_2.parameters(), args.learning_rate)
+
+        # self.max_action = max_action
+        # self.memory = Replay_buffer(args.capacity)
+        self.memory = Replay_buffer(args.capacity)
+        self.writer = writer if writer else SummaryWriter()
         self.num_critic_update_iteration = 0
         self.num_actor_update_iteration = 0
         self.num_training = 0
@@ -859,67 +883,95 @@ class DDPG(object):
         # print(state.shape)
         return self.actor(state).cpu().data.numpy().flatten()
 
-    def update(self):
+    def update(self, num_iteration):
 
-        for it in range(args.update_iteration):
-            # Sample replay buffer
-            x, y, u, r, d = self.replay_buffer.sample(args.batch_size)
+        if self.num_training % 500 == 0:
+            print("====================================")
+            print("model has been trained for {} times...".format(self.num_training))
+            print("====================================")
+        for i in range(num_iteration):
+            x, y, u, r, d = self.memory.sample(args.batch_size)
             state = torch.FloatTensor(x).to(device)
             action = torch.FloatTensor(u).to(device)
             next_state = torch.FloatTensor(y).to(device)
             done = torch.FloatTensor(d).to(device)
             reward = torch.FloatTensor(r).to(device)
 
-            # Compute the target Q value
-            target_Q = self.critic_target(next_state, self.actor_target(next_state))
+            # Select next action according to target policy:
+            noise = torch.ones_like(action).data.normal_(0, args.policy_noise).to(device)
+            noise = noise.clamp(-args.noise_clip, args.noise_clip)
+            next_action = (self.actor_target(next_state) + noise)
+            next_action = next_action.clamp(-self.max_action, self.max_action)
+
+            # Compute target Q-value:
+            target_Q1 = self.critic_1_target(next_state, next_action)
+            target_Q2 = self.critic_2_target(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
             target_Q = reward + ((1 - done) * args.gamma * target_Q).detach()
 
-            # Get current Q estimate
-            current_Q = self.critic(state, action)
+            # Optimize Critic 1:
+            current_Q1 = self.critic_1(state, action)
+            loss_Q1 = F.mse_loss(current_Q1, target_Q)
+            self.critic_1_optimizer.zero_grad()
+            loss_Q1.backward()
+            self.critic_1_optimizer.step()
+            self.writer.add_scalar('Loss/Q1_loss', loss_Q1, global_step=self.num_critic_update_iteration)
 
-            # Compute critic loss
-            critic_loss = F.mse_loss(current_Q, target_Q)
-            self.writer.add_scalar('Loss/critic_loss', critic_loss, global_step=self.num_critic_update_iteration)
-            # Optimize the critic
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
+            # Optimize Critic 2:
+            current_Q2 = self.critic_2(state, action)
+            loss_Q2 = F.mse_loss(current_Q2, target_Q)
+            self.critic_2_optimizer.zero_grad()
+            loss_Q2.backward()
+            self.critic_2_optimizer.step()
+            self.writer.add_scalar('Loss/Q2_loss', loss_Q2, global_step=self.num_critic_update_iteration)
+            # Delayed policy updates:
+            if i % args.policy_delay == 0:
+                # Compute actor loss:
+                actor_loss = - self.critic_1(state, self.actor(state)).mean()
 
-            # Compute actor loss
-            actor_loss = -self.critic(state, self.actor(state)).mean()
-            self.writer.add_scalar('Loss/actor_loss', actor_loss, global_step=self.num_actor_update_iteration)
+                # Optimize the actor
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+                self.writer.add_scalar('Loss/actor_loss', actor_loss, global_step=self.num_actor_update_iteration)
+                for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                    target_param.data.copy_(((1- args.tau) * target_param.data) + args.tau * param.data)
 
-            # Optimize the actor
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+                for param, target_param in zip(self.critic_1.parameters(), self.critic_1_target.parameters()):
+                    target_param.data.copy_(((1 - args.tau) * target_param.data) + args.tau * param.data)
 
-            # Update the frozen target models
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                for param, target_param in zip(self.critic_2.parameters(), self.critic_2_target.parameters()):
+                    target_param.data.copy_(((1 - args.tau) * target_param.data) + args.tau * param.data)
 
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-
-            self.num_actor_update_iteration += 1
-            self.num_critic_update_iteration += 1
+                self.num_actor_update_iteration += 1
+        self.num_critic_update_iteration += 1
+        self.num_training += 1
 
     def save(self):
         torch.save(self.actor.state_dict(), 'actor.pth')
-        torch.save(self.critic.state_dict(), 'critic.pth')
+        torch.save(self.actor_target.state_dict(), 'actor_target.pth')
+        torch.save(self.critic_1.state_dict(), 'critic_1.pth')
+        torch.save(self.critic_1_target.state_dict(), 'critic_1_target.pth')
+        torch.save(self.critic_2.state_dict(), 'critic_2.pth')
+        torch.save(self.critic_2_target.state_dict(), 'critic_2_target.pth')
         print("====================================")
         print("Model has been saved...")
         print("====================================")
 
     def load(self):
         self.actor.load_state_dict(torch.load('actor.pth'))
-        self.critic.load_state_dict(torch.load('critic.pth'))
+        self.actor_target.load_state_dict(torch.load('actor_target.pth'))
+        self.critic_1.load_state_dict(torch.load('critic_1.pth'))
+        self.critic_1_target.load_state_dict(torch.load('critic_1_target.pth'))
+        self.critic_2.load_state_dict(torch.load('critic_2.pth'))
+        self.critic_2_target.load_state_dict(torch.load('critic_2_target.pth'))
         print("====================================")
         print("model has been loaded...")
         print("====================================")
 
+
 def main():
-    agent = DDPG(writer=writer)
+    agent = TD3(writer=writer)
     ep_r = 0
     if args.mode == 'test':
         agent.load()
@@ -953,9 +1005,9 @@ def main():
                 next_state, reward, done, info = env.step(action)
                 ep_r += reward
                 if args.render and i >= args.render_interval : env.render()
-                agent.replay_buffer.push((state, next_state, action, reward, np.float(done)))
+                agent.memory.push((state, next_state, action, reward, np.float(done)))
                 # if (i+1) % 10 == 0:
-                #     print('Episode {},  The memory size is {} '.format(i, len(agent.replay_buffer.storage)))
+                #     print('Episode {},  The memory size is {} '.format(i, len(agent.memory.storage)))
 
                 state = next_state
                 if done or t >= args.max_length_of_trajectory:
@@ -967,7 +1019,7 @@ def main():
 
             if i % args.log_interval == 0:
                 agent.save()
-            if len(agent.replay_buffer.storage) >= args.capacity-1:
+            if len(agent.memory.storage) >= args.capacity-1:
                 agent.update()
 
     else:
